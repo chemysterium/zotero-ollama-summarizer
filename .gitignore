@@ -1,3 +1,19 @@
-# Claude Code local settings / Windows folder metadata (not part of any project)
+# Private configuration (API keys, library IDs)
+config.ini
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Local summary output, if any
+summary_*.txt
+
+# Local tooling / OS files
+.claude/
+desktop.ini
+
+# Claude Code local settings / Windows folder metadata
 .claude/
 desktop.ini

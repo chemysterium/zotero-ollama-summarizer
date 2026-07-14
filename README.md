@@ -69,7 +69,8 @@ can rerun the collection command whenever you add new papers.
 
 1. Finds the item's PDF attachment via the Zotero Web API
 2. Gets the fulltext from Zotero's server-side index, falling back to
-   extracting it from the local PDF (via PyMuPDF) if the index is empty
+   extracting it from the local PDF as structure-aware Markdown (via
+   [pymupdf4llm](https://pypi.org/project/pymupdf4llm/)) if the index is empty
 3. Sends the text to Ollama for summarization — long papers are split into
    overlapping chunks, summarized separately, then combined into one summary
 4. Creates a child note (`AI Summary: <title>`) on the Zotero item
@@ -81,3 +82,19 @@ can rerun the collection command whenever you add new papers.
   notes rather than `.txt` attachments.
 - The Ollama request disables extended "thinking" so reasoning-capable models
   don't spend their whole output budget on hidden reasoning tokens.
+- Markdown extraction was chosen over plain-text extraction after a side-by-side
+  comparison: plain text mangled unicode (units, superscripts) and lost some
+  content the markdown extraction preserved (see `compare_extraction.py`).
+
+## Comparing extraction methods
+
+`compare_extraction.py` is a read-only tool (no writes to Zotero) that extracts
+one paper both ways — plain text and Markdown — summarizes each with the same
+Ollama model, and saves both for comparison:
+
+```
+python compare_extraction.py ABCD1234
+```
+
+Output goes to `comparisons/<item-key>_plain.txt` and `_markdown.txt` (plus the
+raw extracted text/markdown for inspection).

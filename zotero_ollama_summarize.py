@@ -3,7 +3,7 @@ Summarize a Zotero item's PDF fulltext using a local Ollama model and
 save the result back into Zotero as a child note.
 
 Setup:
-    pip install pyzotero requests pymupdf
+    pip install pyzotero requests pymupdf4llm
 
     Copy config.example.ini to config.ini next to this script and fill in
     your Zotero credentials (get an API key at
@@ -27,6 +27,9 @@ from pathlib import Path
 
 import requests
 from pyzotero import zotero
+
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8")
 
 CONFIG_PATH = Path(__file__).resolve().parent / "config.ini"
 
@@ -181,19 +184,19 @@ def get_fulltext(zot: zotero.Zotero, attachment_key: str, attachment_filename: s
     except Exception:
         pass
 
-    # Fall back to reading the PDF directly from local Zotero storage.
+    # Fall back to reading the PDF directly from local Zotero storage, extracted as
+    # structure-aware Markdown rather than raw text: this preserves headers, tables,
+    # and unicode (units, superscripts) far more reliably than plain text extraction,
+    # which measurably improves summary quality and avoids mangled characters.
     local_path = Path(ZOTERO_STORAGE_DIR) / attachment_key / attachment_filename
     if not local_path.exists():
         raise ProcessingError(
             f"No indexed fulltext on the server and no local file at {local_path}. "
             "Set ZOTERO_STORAGE_DIR to your Zotero storage folder, or sync the PDF locally."
         )
-    import fitz  # pymupdf
+    import pymupdf4llm
 
-    doc = fitz.open(local_path)
-    text = "\n".join(page.get_text() for page in doc)
-    doc.close()
-    return text
+    return pymupdf4llm.to_markdown(str(local_path))
 
 
 def chunk_text(text: str) -> list[str]:

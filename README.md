@@ -59,7 +59,7 @@ Options:
 
 | Flag | Effect |
 | --- | --- |
-| `--force` | Re-summarize items that already have an AI Summary note |
+| `--force` | Re-summarize items that already have an AI Summary note, replacing the old note (the old note is deleted only after the new summary is saved, so a failed run never loses an existing summary) |
 | `--dry-run` | Show what would be processed, without calling Ollama or writing to Zotero |
 
 Papers that already have a note starting with `AI Summary:` are skipped, so you

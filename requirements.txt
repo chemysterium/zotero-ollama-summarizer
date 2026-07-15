@@ -1,5 +1,6 @@
 pyzotero>=1.13
 requests>=2.31
+markdown>=3.5
 pymupdf4llm>=1.28
 # Pulled in transitively by pymupdf4llm, but also imported directly by
 # compare_extraction.py for the plain-text baseline.

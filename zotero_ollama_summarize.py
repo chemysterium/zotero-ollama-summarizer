@@ -20,11 +20,13 @@ Usage:
 
 import argparse
 import configparser
+import html
 import os
 import re
 import sys
 from pathlib import Path
 
+import markdown
 import requests
 from pyzotero import zotero
 
@@ -136,35 +138,43 @@ def _summary_has_body(note_html: str) -> bool:
     return bool(body_text.strip())
 
 
+def find_summary_notes(zot: zotero.Zotero, parent_key: str) -> list[dict]:
+    """All child AI Summary notes of an item, as full API objects (delete-able)."""
+    return [
+        child
+        for child in zot.children(parent_key)
+        if child["data"].get("itemType") == "note"
+        and SUMMARY_MARKER in child["data"].get("note", "")
+    ]
+
+
 def has_existing_summary(zot: zotero.Zotero, parent_key: str) -> bool:
-    for child in zot.children(parent_key):
-        data = child["data"]
-        if data.get("itemType") != "note":
-            continue
-        note_html = data.get("note", "")
-        if SUMMARY_MARKER not in note_html:
-            continue
-        # Blank summaries (header but no body) left behind by earlier runs
-        # where the model returned an empty response don't count, so a plain
-        # rerun retries them instead of skipping.
-        if _summary_has_body(note_html):
-            return True
-    return False
+    # Blank summaries (header but no body) left behind by earlier runs where
+    # the model returned an empty response don't count, so a plain rerun
+    # retries them instead of skipping.
+    return any(
+        _summary_has_body(note["data"].get("note", ""))
+        for note in find_summary_notes(zot, parent_key)
+    )
+
+
+def delete_summary_notes(zot: zotero.Zotero, notes: list[dict], label: str) -> None:
+    for note in notes:
+        try:
+            zot.delete_item(note)
+            print(f"  deleted {label} summary note {note['key']}")
+        except Exception as exc:
+            print(f"  warning: could not delete {label} summary note {note['key']}: {exc}")
 
 
 def delete_blank_summary_notes(zot: zotero.Zotero, parent_key: str) -> None:
     """Remove leftover AI Summary notes that have a header but no body."""
-    for child in zot.children(parent_key):
-        data = child["data"]
-        if data.get("itemType") != "note":
-            continue
-        note_html = data.get("note", "")
-        if SUMMARY_MARKER in note_html and not _summary_has_body(note_html):
-            try:
-                zot.delete_item(child)
-                print(f"  deleted blank summary note {child['key']}")
-            except Exception as exc:
-                print(f"  warning: could not delete blank summary note {child['key']}: {exc}")
+    blanks = [
+        note
+        for note in find_summary_notes(zot, parent_key)
+        if not _summary_has_body(note["data"].get("note", ""))
+    ]
+    delete_summary_notes(zot, blanks, "blank")
 
 
 def find_pdf_attachment(zot: zotero.Zotero, parent_key: str) -> dict:
@@ -221,7 +231,10 @@ def ollama_chat(prompt: str) -> str:
                     "role": "system",
                     "content": "You are a precise research assistant. Summarize academic "
                     "papers accurately, preserving key findings, methods, and limitations. "
-                    "Do not invent information not present in the text.",
+                    "Do not invent information not present in the text. Write in plain "
+                    "Markdown. Never use LaTeX notation ($...$, \\text{}, ^{} etc.); "
+                    "write formulas, isotopes, and math with plain Unicode characters "
+                    "instead (e.g. H₂O, ⁶Li/⁷Li, 10⁻³, ≈, °C).",
                 },
                 {"role": "user", "content": prompt},
             ],
@@ -270,12 +283,21 @@ def summarize(fulltext: str) -> str:
 
 
 def save_note(zot: zotero.Zotero, parent_key: str, title: str, summary: str) -> None:
+    # Zotero notes are HTML; the model answers in Markdown (it mirrors the
+    # markdown-formatted paper text it receives), so convert before saving or
+    # the note shows raw **bold**/###/~ markup.
+    # nl2br keeps single newlines visible as line breaks (models often separate
+    # heading lines and bullets with a single newline, which plain Markdown
+    # would otherwise collapse into one paragraph).
+    summary_html = markdown.markdown(
+        summary, extensions=["sane_lists", "tables", "nl2br"]
+    )
     # Built by hand rather than via zot.item_template("note"): pyzotero caches that
     # template and, once it's over an hour old, revalidates it with a request that
     # (due to a pyzotero bug) omits the required itemType param, causing a 400.
     note = {
         "itemType": "note",
-        "note": f"<h1>AI Summary: {title}</h1><p>{summary.replace(chr(10), '<br>')}</p>",
+        "note": f"<h1>AI Summary: {html.escape(title)}</h1>{summary_html}",
         "tags": [],
         "collections": [],
         "relations": {},
@@ -288,7 +310,11 @@ def save_note(zot: zotero.Zotero, parent_key: str, title: str, summary: str) -> 
         print("  saved summary as a Zotero note.")
 
 
-def process_item(zot: zotero.Zotero, key: str, title: str) -> None:
+def process_item(zot: zotero.Zotero, key: str, title: str, replace: bool = False) -> None:
+    # Collect the notes to replace up front, but only delete them after the
+    # new summary is saved, so a failed run never loses an existing summary.
+    old_notes = find_summary_notes(zot, key) if replace else []
+
     attachment = find_pdf_attachment(zot, key)
     print(f"  extracting fulltext from attachment {attachment['key']}...")
     fulltext = get_fulltext(zot, attachment["key"], attachment.get("filename", ""))
@@ -298,7 +324,10 @@ def process_item(zot: zotero.Zotero, key: str, title: str) -> None:
     summary = summarize(fulltext)
 
     save_note(zot, key, title, summary)
-    delete_blank_summary_notes(zot, key)
+    if old_notes:
+        delete_summary_notes(zot, old_notes, "old")
+    else:
+        delete_blank_summary_notes(zot, key)
 
 
 def main() -> None:
@@ -311,7 +340,8 @@ def main() -> None:
     )
     parser.add_argument(
         "--force", action="store_true",
-        help="Re-summarize items that already have an AI Summary note",
+        help="Re-summarize items that already have an AI Summary note, replacing "
+        "the old note (deleted only after the new summary is saved)",
     )
     parser.add_argument(
         "--dry-run", action="store_true",
@@ -349,7 +379,7 @@ def main() -> None:
                 continue
 
             try:
-                process_item(zot, paper["key"], paper["title"])
+                process_item(zot, paper["key"], paper["title"], replace=args.force)
                 processed += 1
             except Exception as exc:
                 print(f"  ERROR: {exc}")
@@ -373,7 +403,7 @@ def main() -> None:
                 attachment = find_pdf_attachment(zot, key)
                 print(f"Would summarize (PDF attachment {attachment['key']} found).")
                 return
-            process_item(zot, key, title)
+            process_item(zot, key, title, replace=args.force)
         except ProcessingError as exc:
             sys.exit(str(exc))
         print("Done.")

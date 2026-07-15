@@ -282,6 +282,45 @@ def summarize(fulltext: str) -> str:
     )
 
 
+# The prompt asks the model to avoid LaTeX, but local models don't reliably
+# obey, so leftover math spans like $NH_3$ or $10^4$ are converted to HTML here.
+_LATEX_SYMBOLS = {
+    r"\approx": "≈", r"\sim": "~", r"\times": "×", r"\pm": "±", r"\cdot": "·",
+    r"\degree": "°", r"\rightarrow": "→", r"\to": "→", r"\leq": "≤", r"\le": "≤",
+    r"\geq": "≥", r"\ge": "≥", r"\infty": "∞", r"\%": "%",
+    r"\alpha": "α", r"\beta": "β", r"\gamma": "γ", r"\delta": "δ", r"\Delta": "Δ",
+    r"\epsilon": "ε", r"\lambda": "λ", r"\mu": "μ", r"\pi": "π", r"\sigma": "σ",
+    r"\tau": "τ", r"\phi": "φ", r"\omega": "ω",
+}
+
+
+def _convert_math_span(expr: str) -> str:
+    expr = re.sub(r"\\(?:text|mathrm|mathit|mathbf)\{([^{}]*)\}", r"\1", expr)
+    expr = expr.replace(r"^\circ", "°")
+    for macro, char in _LATEX_SYMBOLS.items():
+        expr = expr.replace(macro, char)
+    expr = re.sub(r"\^\{([^{}]*)\}", r"<sup>\1</sup>", expr)
+    expr = re.sub(r"\^(\S)", r"<sup>\1</sup>", expr)
+    expr = re.sub(r"_\{([^{}]*)\}", r"<sub>\1</sub>", expr)
+    expr = re.sub(r"_(\S)", r"<sub>\1</sub>", expr)
+    return expr.replace("{", "").replace("}", "").strip()
+
+
+def strip_latex(text: str) -> str:
+    """Convert $...$ math spans to plain HTML (e.g. $NH_3$ -> NH<sub>3</sub>).
+
+    Only spans containing LaTeX-ish characters (_, ^ or \\) are touched, so
+    ordinary text between dollar signs ("$5 and $10") is left alone.
+    """
+    def replace(match: re.Match) -> str:
+        inner = match.group(1) if match.group(1) is not None else match.group(2)
+        if re.search(r"[_^\\]", inner):
+            return _convert_math_span(inner)
+        return match.group(0)
+
+    return re.sub(r"\$\$([^$]+?)\$\$|\$([^$\n]+?)\$", replace, text)
+
+
 def save_note(zot: zotero.Zotero, parent_key: str, title: str, summary: str) -> None:
     # Zotero notes are HTML; the model answers in Markdown (it mirrors the
     # markdown-formatted paper text it receives), so convert before saving or
@@ -290,7 +329,7 @@ def save_note(zot: zotero.Zotero, parent_key: str, title: str, summary: str) -> 
     # heading lines and bullets with a single newline, which plain Markdown
     # would otherwise collapse into one paragraph).
     summary_html = markdown.markdown(
-        summary, extensions=["sane_lists", "tables", "nl2br"]
+        strip_latex(summary), extensions=["sane_lists", "tables", "nl2br"]
     )
     # Built by hand rather than via zot.item_template("note"): pyzotero caches that
     # template and, once it's over an hour old, revalidates it with a request that

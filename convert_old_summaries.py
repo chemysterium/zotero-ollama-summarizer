@@ -45,9 +45,131 @@ def _text_content(note_html: str) -> str:
     return html.unescape(text)
 
 
+def _strip_h1(note_html: str) -> str:
+    return re.sub(r"<h1>.*?</h1>", "", note_html, count=1, flags=re.DOTALL)
+
+
+# Tags that only a Markdown render produces; old raw notes contain just <p>/<br>.
+_RENDERED_TAG = re.compile(
+    r"<(?:h[2-6]|ul|ol|li|strong|em|sub|sup|table|code)\b", re.IGNORECASE
+)
+
+
+def is_rendered(note_html: str) -> bool:
+    """True if the note body has already been rendered from Markdown to HTML."""
+    return bool(_RENDERED_TAG.search(_strip_h1(note_html)))
+
+
 def needs_conversion(note_html: str) -> bool:
-    body = re.sub(r"<h1>.*?</h1>", "", note_html, count=1, flags=re.DOTALL)
-    return bool(_MD_ARTIFACTS.search(_text_content(body)))
+    return bool(_MD_ARTIFACTS.search(_text_content(_strip_h1(note_html))))
+
+
+_BULLET_START = re.compile(r"^[*+-]\s+(?=\S)")
+
+
+def fix_literal_bullets(note_html: str) -> str:
+    """Turn literal '*  item<br />' lines inside <p> blocks into real <ul> lists.
+
+    Markdown's sane_lists needs a blank line before a list, so summaries where
+    bullets follow a text line directly were rendered with the bullets left as
+    literal '*' text. Rebuilding just those paragraphs (rather than re-rendering
+    the note from its stripped text) keeps the inline <strong>/<sub>/<em> markup
+    the render already produced.
+    """
+    def fix_block(match: re.Match) -> str:
+        parts = re.split(r"<br\s*/?>", match.group(1))
+        if not any(_BULLET_START.match(p.strip()) for p in parts):
+            return match.group(0)
+
+        blocks: list[str] = []
+        text_run: list[str] = []
+        list_run: list[str] = []
+
+        def flush_text() -> None:
+            if text_run:
+                blocks.append("<p>" + "<br />".join(text_run) + "</p>")
+                text_run.clear()
+
+        def flush_list() -> None:
+            if list_run:
+                blocks.append(
+                    "<ul>" + "".join(f"<li>{item}</li>" for item in list_run) + "</ul>"
+                )
+                list_run.clear()
+
+        for part in parts:
+            line = part.strip()
+            if not line:
+                continue
+            if _BULLET_START.match(line):
+                flush_text()
+                list_run.append(_BULLET_START.sub("", line, count=1))
+            else:
+                flush_list()
+                text_run.append(line)
+        flush_text()
+        flush_list()
+        return "".join(blocks)
+
+    return re.sub(r"<p>(.*?)</p>", fix_block, note_html, flags=re.DOTALL)
+
+
+def fix_bullets_inside_list_items(note_html: str) -> str:
+    """Turn a literal '*  item' line inside an <li> into a nested sub-list.
+
+    Same cause as fix_literal_bullets, but for bullets the model nested under
+    an existing list item; those live inside <li>...</li> rather than a <p>.
+    Only innermost list items are matched (the content may not contain further
+    <li> tags), so nested lists are rewritten from the inside out.
+    """
+    def fix(match: re.Match) -> str:
+        parts = re.split(r"<br\s*/?>", match.group(1))
+        if not any(_BULLET_START.match(p.strip()) for p in parts):
+            return match.group(0)
+
+        head: list[str] = []
+        items: list[str] = []
+        for part in parts:
+            line = part.strip()
+            if not line:
+                continue
+            if _BULLET_START.match(line):
+                items.append(_BULLET_START.sub("", line, count=1))
+            elif items:
+                # Continuation text after a sub-bullet belongs to that bullet.
+                items[-1] += "<br />" + line
+            else:
+                head.append(line)
+        if not items or not head:
+            return match.group(0)
+
+        nested = "<ul>" + "".join(f"<li>{item}</li>" for item in items) + "</ul>"
+        return "<li>" + "<br />".join(head) + nested + "</li>"
+
+    return re.sub(r"<li>((?:(?!</?li\b).)*?)</li>", fix, note_html, flags=re.DOTALL)
+
+
+def join_math_split_by_br(note_html: str) -> str:
+    """Rejoin a $...$ span that an earlier render split with a line break.
+
+    Rendering wrapped long lines mid-formula, leaving notes with markup like
+    "$\\text<br />{H}^+$", which no longer looks like math to strip_latex. Only
+    spans whose joined content is LaTeX-ish (\\, ^ or _) are rejoined, so an
+    ordinary "$5<br />and $10" is left as it is.
+    """
+    def join(match: re.Match) -> str:
+        inner = match.group(1) + match.group(2)
+        if re.search(r"[\\^_]", inner) and inner == inner.strip():
+            return f"${inner}$"
+        return match.group(0)
+
+    return re.sub(r"\$([^$<>]*)<br\s*/?>\s*\n?([^$<>]*)\$", join, note_html)
+
+
+def repair_rendered_note(note_html: str) -> str:
+    """Fix leftover artifacts in an already-rendered note, keeping its markup."""
+    fixed = fix_bullets_inside_list_items(fix_literal_bullets(note_html))
+    return zos.strip_latex(join_math_split_by_br(fixed))
 
 
 def convert_note_html(note_html: str) -> str:
@@ -58,10 +180,7 @@ def convert_note_html(note_html: str) -> str:
     body = note_html[header_match.end():] if header_match else note_html
 
     md = _text_content(body).strip()
-    body_html = markdown.markdown(
-        zos.strip_latex(md), extensions=["sane_lists", "tables", "nl2br"]
-    )
-    return f"{header}{body_html}"
+    return f"{header}{zos.render_markdown(md)}"
 
 
 def all_summary_notes(zot) -> list[dict]:
@@ -118,25 +237,39 @@ def main() -> None:
     converted = skipped = failed = 0
     for note in notes:
         note_html = note["data"].get("note", "")
-        if not needs_conversion(note_html):
+
+        if is_rendered(note_html):
+            # Already HTML: repair leftover artifacts in place, so the inline
+            # markup from the earlier render survives.
+            new_html = repair_rendered_note(note_html)
+            action = "repaired"
+        elif needs_conversion(note_html):
+            # Raw Markdown stored as text: render the whole body.
+            new_html = convert_note_html(note_html)
+            action = "converted"
+        else:
+            skipped += 1
+            continue
+
+        if new_html == note_html:
             skipped += 1
             continue
 
         if args.dry_run:
-            print(f"  would convert: {note_label(note)}")
+            print(f"  would be {action}: {note_label(note)}")
             converted += 1
             continue
 
         try:
-            note["data"]["note"] = convert_note_html(note_html)
+            note["data"]["note"] = new_html
             zot.update_item(note["data"])
-            print(f"  converted: {note_label(note)}")
+            print(f"  {action}: {note_label(note)}")
             converted += 1
         except Exception as exc:
-            print(f"  ERROR converting {note['key']}: {exc}")
+            print(f"  ERROR for {note['key']}: {exc}")
             failed += 1
 
-    verb = "would convert" if args.dry_run else "converted"
+    verb = "would fix" if args.dry_run else "fixed"
     print(
         f"Done. {converted} {verb}, {skipped} already clean, {failed} failed."
     )

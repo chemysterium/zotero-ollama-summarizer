@@ -306,31 +306,70 @@ def _convert_math_span(expr: str) -> str:
     return expr.replace("{", "").replace("}", "").strip()
 
 
+# A math span never starts or ends with whitespace, and never contains < or >.
+# Both rules live in the pattern rather than in the replace function so that a
+# money-like "$5 and $10" simply doesn't match: were it matched and then
+# declined, re.sub would still consume its dollar signs and a real math span
+# right after it ("... from $5 and $\text{CO}_2$") could no longer be found.
+_MATH_INNER = r"[^$\n<>\s](?:[^$\n<>]*[^$\n<>\s])?"
+
+
 def strip_latex(text: str) -> str:
     """Convert $...$ math spans to plain HTML (e.g. $NH_3$ -> NH<sub>3</sub>).
 
-    Only spans containing LaTeX-ish characters (_, ^ or \\) are touched, so
-    ordinary text between dollar signs ("$5 and $10") is left alone.
+    Spans containing LaTeX-ish characters (_, ^ or \\) become HTML; other spans
+    just lose the dollar signs ($120$, $NaOH$, $I = 0.01$). Ordinary text
+    between dollar signs ("costs $5 and $10") is left alone. In HTML the < and
+    > of real math arrive escaped, so those spans still convert.
     """
     def replace(match: re.Match) -> str:
         inner = match.group(1) if match.group(1) is not None else match.group(2)
         if re.search(r"[_^\\]", inner):
             return _convert_math_span(inner)
-        return match.group(0)
+        return inner
 
-    return re.sub(r"\$\$([^$]+?)\$\$|\$([^$\n]+?)\$", replace, text)
+    return re.sub(rf"\$\$({_MATH_INNER})\$\$|\$({_MATH_INNER})\$", replace, text)
+
+
+_LIST_LINE = re.compile(r"^\s{0,3}(?:[*+-]\s+|\d+[.)]\s+)\S")
+
+
+def _blank_line_before_lists(md: str) -> str:
+    """Insert a blank line between a paragraph line and a list that follows it.
+
+    The sane_lists extension only starts a list when a blank line precedes it,
+    but models routinely write "**Key Findings**" immediately followed by
+    "*   item" — without this, those bullets render as literal "*" text.
+    """
+    out: list[str] = []
+    for line in md.split("\n"):
+        if (
+            _LIST_LINE.match(line)
+            and out
+            and out[-1].strip()
+            and not _LIST_LINE.match(out[-1])
+        ):
+            out.append("")
+        out.append(line)
+    return "\n".join(out)
+
+
+def render_markdown(md: str) -> str:
+    """Render the model's Markdown answer to the HTML stored in a Zotero note.
+
+    Zotero notes are HTML; the model answers in Markdown (it mirrors the
+    markdown-formatted paper text it receives), so convert before saving or the
+    note shows raw **bold**/### markup. nl2br keeps single newlines visible as
+    line breaks, which models use to separate heading lines and bullets.
+    """
+    return markdown.markdown(
+        strip_latex(_blank_line_before_lists(md)),
+        extensions=["sane_lists", "tables", "nl2br"],
+    )
 
 
 def save_note(zot: zotero.Zotero, parent_key: str, title: str, summary: str) -> None:
-    # Zotero notes are HTML; the model answers in Markdown (it mirrors the
-    # markdown-formatted paper text it receives), so convert before saving or
-    # the note shows raw **bold**/###/~ markup.
-    # nl2br keeps single newlines visible as line breaks (models often separate
-    # heading lines and bullets with a single newline, which plain Markdown
-    # would otherwise collapse into one paragraph).
-    summary_html = markdown.markdown(
-        strip_latex(summary), extensions=["sane_lists", "tables", "nl2br"]
-    )
+    summary_html = render_markdown(summary)
     # Built by hand rather than via zot.item_template("note"): pyzotero caches that
     # template and, once it's over an hour old, revalidates it with a request that
     # (due to a pyzotero bug) omits the required itemType param, causing a 400.
